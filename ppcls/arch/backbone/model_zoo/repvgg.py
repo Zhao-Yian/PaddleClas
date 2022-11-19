@@ -15,147 +15,119 @@
 # Code was based on https://github.com/DingXiaoH/RepVGG
 # reference: https://arxiv.org/abs/2101.03697
 
-import paddle.nn as nn
+
+
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import paddle
+import paddle.nn as nn
+import paddle.nn.functional as F
+from paddle import ParamAttr
+from paddle.regularizer import L2Decay
+from paddle.nn import Conv2D, BatchNorm2D, ReLU, AdaptiveAvgPool2D, MaxPool2D
+from paddle.nn.initializer import Constant
+
+from ppcls.utils.ops import get_act_fn
+
 import numpy as np
 
 from ....utils.save_load import load_dygraph_pretrain, load_dygraph_pretrain_from_url
 
-MODEL_URLS = {
-    "RepVGG_A0":
-    "https://paddle-imagenet-models-name.bj.bcebos.com/dygraph/RepVGG_A0_pretrained.pdparams",
-    "RepVGG_A1":
-    "https://paddle-imagenet-models-name.bj.bcebos.com/dygraph/RepVGG_A1_pretrained.pdparams",
-    "RepVGG_A2":
-    "https://paddle-imagenet-models-name.bj.bcebos.com/dygraph/RepVGG_A2_pretrained.pdparams",
-    "RepVGG_B0":
-    "https://paddle-imagenet-models-name.bj.bcebos.com/dygraph/RepVGG_B0_pretrained.pdparams",
-    "RepVGG_B1":
-    "https://paddle-imagenet-models-name.bj.bcebos.com/dygraph/RepVGG_B1_pretrained.pdparams",
-    "RepVGG_B2":
-    "https://paddle-imagenet-models-name.bj.bcebos.com/dygraph/RepVGG_B2_pretrained.pdparams",
-    "RepVGG_B1g2":
-    "https://paddle-imagenet-models-name.bj.bcebos.com/dygraph/RepVGG_B1g2_pretrained.pdparams",
-    "RepVGG_B1g4":
-    "https://paddle-imagenet-models-name.bj.bcebos.com/dygraph/RepVGG_B1g4_pretrained.pdparams",
-    "RepVGG_B2g4":
-    "https://paddle-imagenet-models-name.bj.bcebos.com/dygraph/RepVGG_B2g4_pretrained.pdparams",
-    "RepVGG_B3g4":
-    "https://paddle-imagenet-models-name.bj.bcebos.com/dygraph/RepVGG_B3g4_pretrained.pdparams",
-}
-
-__all__ = list(MODEL_URLS.keys())
-
-optional_groupwise_layers = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26]
-g2_map = {l: 2 for l in optional_groupwise_layers}
-g4_map = {l: 4 for l in optional_groupwise_layers}
+__all__ = ['CSPResNet', 'BasicBlock', 'EffectiveSELayer', 'ConvBNLayer']
 
 
-class ConvBN(nn.Layer):
+class ConvBNLayer(nn.Layer):
     def __init__(self,
-                 in_channels,
-                 out_channels,
-                 kernel_size,
-                 stride,
-                 padding,
-                 groups=1):
-        super(ConvBN, self).__init__()
+                 ch_in,
+                 ch_out,
+                 filter_size=3,
+                 stride=1,
+                 groups=1,
+                 padding=0,
+                 act=None):
+        super(ConvBNLayer, self).__init__()
+
         self.conv = nn.Conv2D(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
+            in_channels=ch_in,
+            out_channels=ch_out,
+            kernel_size=filter_size,
             stride=stride,
             padding=padding,
             groups=groups,
             bias_attr=False)
-        self.bn = nn.BatchNorm2D(num_features=out_channels)
+
+        self.bn = nn.BatchNorm2D(
+            ch_out,
+            weight_attr=ParamAttr(regularizer=L2Decay(0.0)),
+            bias_attr=ParamAttr(regularizer=L2Decay(0.0)))
+        self.act = get_act_fn(act) if act is None or isinstance(act, (
+            str, dict)) else act
 
     def forward(self, x):
-        y = self.conv(x)
-        y = self.bn(y)
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.act(x)
+
+        return x
+
+
+class RepVggBlock(nn.Layer):
+    def __init__(self, ch_in, ch_out, act='relu', alpha=False):
+        super(RepVggBlock, self).__init__()
+        self.ch_in = ch_in
+        self.ch_out = ch_out
+        self.conv1 = ConvBNLayer(
+            ch_in, ch_out, 3, stride=1, padding=1, act=None)
+        self.conv2 = ConvBNLayer(
+            ch_in, ch_out, 1, stride=1, padding=0, act=None)
+        self.act = get_act_fn(act) if act is None or isinstance(act, (
+            str, dict)) else act
+        if alpha:
+            self.alpha = self.create_parameter(
+                shape=[1],
+                attr=ParamAttr(initializer=Constant(value=1.)),
+                dtype="float32")
+        else:
+            self.alpha = None
+
+    def forward(self, x):
+        if hasattr(self, 'conv'):
+            y = self.conv(x)
+        else:
+            if self.alpha:
+                y = self.conv1(x) + self.alpha * self.conv2(x)
+            else:
+                y = self.conv1(x) + self.conv2(x)
+        y = self.act(y)
         return y
 
-
-class RepVGGBlock(nn.Layer):
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 kernel_size,
-                 stride=1,
-                 padding=0,
-                 dilation=1,
-                 groups=1,
-                 padding_mode='zeros'):
-        super(RepVGGBlock, self).__init__()
-        self.is_repped = False
-
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
-        self.dilation = dilation
-        self.groups = groups
-        self.padding_mode = padding_mode
-
-        assert kernel_size == 3
-        assert padding == 1
-
-        padding_11 = padding - kernel_size // 2
-
-        self.nonlinearity = nn.ReLU()
-
-        self.rbr_identity = nn.BatchNorm2D(
-            num_features=in_channels
-        ) if out_channels == in_channels and stride == 1 else None
-        self.rbr_dense = ConvBN(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            groups=groups)
-        self.rbr_1x1 = ConvBN(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=1,
-            stride=stride,
-            padding=padding_11,
-            groups=groups)
-
-    def forward(self, inputs):
-        if self.is_repped:
-            return self.nonlinearity(self.rbr_reparam(inputs))
-
-        if self.rbr_identity is None:
-            id_out = 0
-        else:
-            id_out = self.rbr_identity(inputs)
-        return self.nonlinearity(
-            self.rbr_dense(inputs) + self.rbr_1x1(inputs) + id_out)
-
-    def rep(self):
-        if not hasattr(self, 'rbr_reparam'):
-            self.rbr_reparam = nn.Conv2D(
-                in_channels=self.in_channels,
-                out_channels=self.out_channels,
-                kernel_size=self.kernel_size,
-                stride=self.stride,
-                padding=self.padding,
-                dilation=self.dilation,
-                groups=self.groups,
-                padding_mode=self.padding_mode)
+    def convert_to_deploy(self):
+        if not hasattr(self, 'conv'):
+            self.conv = nn.Conv2D(
+                in_channels=self.ch_in,
+                out_channels=self.ch_out,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                groups=1)
         kernel, bias = self.get_equivalent_kernel_bias()
-        self.rbr_reparam.weight.set_value(kernel)
-        self.rbr_reparam.bias.set_value(bias)
-        self.is_repped = True
+        self.conv.weight.set_value(kernel)
+        self.conv.bias.set_value(bias)
+        self.__delattr__('conv1')
+        self.__delattr__('conv2')
 
     def get_equivalent_kernel_bias(self):
-        kernel3x3, bias3x3 = self._fuse_bn_tensor(self.rbr_dense)
-        kernel1x1, bias1x1 = self._fuse_bn_tensor(self.rbr_1x1)
-        kernelid, biasid = self._fuse_bn_tensor(self.rbr_identity)
-        return kernel3x3 + self._pad_1x1_to_3x3_tensor(
-            kernel1x1) + kernelid, bias3x3 + bias1x1 + biasid
+        kernel3x3, bias3x3 = self._fuse_bn_tensor(self.conv1)
+        kernel1x1, bias1x1 = self._fuse_bn_tensor(self.conv2)
+        if self.alpha:
+            return kernel3x3 + self.alpha * self._pad_1x1_to_3x3_tensor(
+                kernel1x1), bias3x3 + self.alpha * bias1x1
+        else:
+            return kernel3x3 + self._pad_1x1_to_3x3_tensor(
+                kernel1x1), bias3x3 + bias1x1
 
     def _pad_1x1_to_3x3_tensor(self, kernel1x1):
         if kernel1x1 is None:
@@ -166,93 +138,204 @@ class RepVGGBlock(nn.Layer):
     def _fuse_bn_tensor(self, branch):
         if branch is None:
             return 0, 0
-        if isinstance(branch, ConvBN):
-            kernel = branch.conv.weight
-            running_mean = branch.bn._mean
-            running_var = branch.bn._variance
-            gamma = branch.bn.weight
-            beta = branch.bn.bias
-            eps = branch.bn._epsilon
-        else:
-            assert isinstance(branch, nn.BatchNorm2D)
-            if not hasattr(self, 'id_tensor'):
-                input_dim = self.in_channels // self.groups
-                kernel_value = np.zeros(
-                    (self.in_channels, input_dim, 3, 3), dtype=np.float32)
-                for i in range(self.in_channels):
-                    kernel_value[i, i % input_dim, 1, 1] = 1
-                self.id_tensor = paddle.to_tensor(kernel_value)
-            kernel = self.id_tensor
-            running_mean = branch._mean
-            running_var = branch._variance
-            gamma = branch.weight
-            beta = branch.bias
-            eps = branch._epsilon
+        kernel = branch.conv.weight
+        running_mean = branch.bn._mean
+        running_var = branch.bn._variance
+        gamma = branch.bn.weight
+        beta = branch.bn.bias
+        eps = branch.bn._epsilon
         std = (running_var + eps).sqrt()
         t = (gamma / std).reshape((-1, 1, 1, 1))
         return kernel * t, beta - running_mean * gamma / std
 
 
-class RepVGG(nn.Layer):
+class BasicBlock(nn.Layer):
     def __init__(self,
-                 num_blocks,
-                 width_multiplier=None,
-                 override_groups_map=None,
-                 class_num=1000):
-        super(RepVGG, self).__init__()
-
-        assert len(width_multiplier) == 4
-        self.override_groups_map = override_groups_map or dict()
-
-        assert 0 not in self.override_groups_map
-
-        self.in_planes = min(64, int(64 * width_multiplier[0]))
-
-        self.stage0 = RepVGGBlock(
-            in_channels=3,
-            out_channels=self.in_planes,
-            kernel_size=3,
-            stride=2,
-            padding=1)
-        self.cur_layer_idx = 1
-        self.stage1 = self._make_stage(
-            int(64 * width_multiplier[0]), num_blocks[0], stride=2)
-        self.stage2 = self._make_stage(
-            int(128 * width_multiplier[1]), num_blocks[1], stride=2)
-        self.stage3 = self._make_stage(
-            int(256 * width_multiplier[2]), num_blocks[2], stride=2)
-        self.stage4 = self._make_stage(
-            int(512 * width_multiplier[3]), num_blocks[3], stride=2)
-        self.gap = nn.AdaptiveAvgPool2D(output_size=1)
-        self.linear = nn.Linear(int(512 * width_multiplier[3]), class_num)
-
-    def _make_stage(self, planes, num_blocks, stride):
-        strides = [stride] + [1] * (num_blocks - 1)
-        blocks = []
-        for stride in strides:
-            cur_groups = self.override_groups_map.get(self.cur_layer_idx, 1)
-            blocks.append(
-                RepVGGBlock(
-                    in_channels=self.in_planes,
-                    out_channels=planes,
-                    kernel_size=3,
-                    stride=stride,
-                    padding=1,
-                    groups=cur_groups))
-            self.in_planes = planes
-            self.cur_layer_idx += 1
-        return nn.Sequential(*blocks)
+                 ch_in,
+                 ch_out,
+                 act='relu',
+                 shortcut=True,
+                 use_alpha=False):
+        super(BasicBlock, self).__init__()
+        assert ch_in == ch_out
+        self.conv1 = ConvBNLayer(ch_in, ch_out, 3, stride=1, padding=1, act=act)
+        self.conv2 = RepVggBlock(ch_out, ch_out, act=act, alpha=use_alpha)
+        self.shortcut = shortcut
 
     def forward(self, x):
-        out = self.stage0(x)
-        out = self.stage1(out)
-        out = self.stage2(out)
-        out = self.stage3(out)
-        out = self.stage4(out)
-        out = self.gap(out)
-        out = paddle.flatten(out, start_axis=1)
-        out = self.linear(out)
-        return out
+        y = self.conv1(x)
+        y = self.conv2(y)
+        if self.shortcut:
+            return paddle.add(x, y)
+        else:
+            return y
+
+
+class EffectiveSELayer(nn.Layer):
+    """ Effective Squeeze-Excitation
+    From `CenterMask : Real-Time Anchor-Free Instance Segmentation` - https://arxiv.org/abs/1911.06667
+    """
+
+    def __init__(self, channels, act='hardsigmoid'):
+        super(EffectiveSELayer, self).__init__()
+        self.fc = nn.Conv2D(channels, channels, kernel_size=1, padding=0)
+        self.act = get_act_fn(act) if act is None or isinstance(act, (
+            str, dict)) else act
+
+    def forward(self, x):
+        x_se = x.mean((2, 3), keepdim=True)
+        x_se = self.fc(x_se)
+        return x * self.act(x_se)
+
+
+class CSPResStage(nn.Layer):
+    def __init__(self,
+                 block_fn,
+                 ch_in,
+                 ch_out,
+                 n,
+                 stride,
+                 act='relu',
+                 attn='eca',
+                 use_alpha=False):
+        super(CSPResStage, self).__init__()
+
+        ch_mid = (ch_in + ch_out) // 2
+        if stride == 2:
+            self.conv_down = ConvBNLayer(
+                ch_in, ch_mid, 3, stride=2, padding=1, act=act)
+        else:
+            self.conv_down = None
+        self.conv1 = ConvBNLayer(ch_mid, ch_mid // 2, 1, act=act)
+        self.conv2 = ConvBNLayer(ch_mid, ch_mid // 2, 1, act=act)
+        self.blocks = nn.Sequential(*[
+            block_fn(
+                ch_mid // 2,
+                ch_mid // 2,
+                act=act,
+                shortcut=True,
+                use_alpha=use_alpha) for i in range(n)
+        ])
+        if attn:
+            self.attn = EffectiveSELayer(ch_mid, act='hardsigmoid')
+        else:
+            self.attn = None
+
+        self.conv3 = ConvBNLayer(ch_mid, ch_out, 1, act=act)
+
+    def forward(self, x):
+        if self.conv_down is not None:
+            x = self.conv_down(x)
+        y1 = self.conv1(x)
+        y2 = self.blocks(self.conv2(x))
+        y = paddle.concat([y1, y2], axis=1)
+        if self.attn is not None:
+            y = self.attn(y)
+        y = self.conv3(y)
+        return y
+
+
+class CSPResNet(nn.Layer):
+    __shared__ = ['width_mult', 'depth_mult', 'trt']
+
+    def __init__(self,
+                 layers=[3, 6, 6, 3],
+                 channels=[64, 128, 256, 512, 1024],
+                 act='swish',
+                 return_idx=[1, 2, 3],
+                 depth_wise=False,
+                 use_large_stem=False,
+                 width_mult=1.0,
+                 depth_mult=1.0,
+                 trt=False,
+                 use_checkpoint=False,
+                 use_alpha=False,
+                 **args):
+        super(CSPResNet, self).__init__()
+        self.use_checkpoint = use_checkpoint
+        channels = [max(round(c * width_mult), 1) for c in channels]
+        layers = [max(round(l * depth_mult), 1) for l in layers]
+        act = get_act_fn(
+            act, trt=trt) if act is None or isinstance(act,
+                                                       (str, dict)) else act
+
+        if use_large_stem:
+            self.stem = nn.Sequential(
+                ('conv1', ConvBNLayer(
+                    3, channels[0] // 2, 3, stride=2, padding=1, act=act)),
+                ('conv2', ConvBNLayer(
+                    channels[0] // 2,
+                    channels[0] // 2,
+                    3,
+                    stride=1,
+                    padding=1,
+                    act=act)), ('conv3', ConvBNLayer(
+                        channels[0] // 2,
+                        channels[0],
+                        3,
+                        stride=1,
+                        padding=1,
+                        act=act)))
+        else:
+            self.stem = nn.Sequential(
+                ('conv1', ConvBNLayer(
+                    3, channels[0] // 2, 3, stride=2, padding=1, act=act)),
+                ('conv2', ConvBNLayer(
+                    channels[0] // 2,
+                    channels[0],
+                    3,
+                    stride=1,
+                    padding=1,
+                    act=act)))
+
+        n = len(channels) - 1
+        self.stages = nn.Sequential(*[(str(i), CSPResStage(
+            BasicBlock,
+            channels[i],
+            channels[i + 1],
+            layers[i],
+            2,
+            act=act,
+            use_alpha=use_alpha)) for i in range(n)])
+
+        self._out_channels = channels[1:]
+        self._out_strides = [4 * 2**i for i in range(n)]
+        self.return_idx = return_idx
+        if use_checkpoint:
+            paddle.seed(0)
+        
+        self.class_expand = 2048
+        self.use_last_conv = True
+        self.avg_pool = AdaptiveAvgPool2D(1)
+        if self.use_last_conv:
+            self.last_conv = Conv2D(
+                in_channels=1024,
+                out_channels=self.class_expand,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias_attr=False)
+            self.act = nn.ReLU()
+            self.dropout = nn.Dropout(
+                p=0.1, mode="downscale_in_infer")
+
+        self.flatten = nn.Flatten(start_axis=1, stop_axis=-1)
+        self.fc = nn.Linear(self.class_expand
+                            if self.use_last_conv else 1024, 1000)
+
+    def forward(self, x):
+        x = self.stem(x)
+        for stage in self.stages:
+            x = stage(x)
+
+        x = self.avg_pool(x)
+        if self.use_last_conv:
+            x = self.last_conv(x)
+            x = self.act(x)
+            x = self.dropout(x)
+        x = self.flatten(x)
+        x = self.fc(x)
+        return x
 
 
 def _load_pretrained(pretrained, model, model_url, use_ssld=False):
@@ -269,13 +352,7 @@ def _load_pretrained(pretrained, model, model_url, use_ssld=False):
 
 
 def RepVGG_A0(pretrained=False, use_ssld=False, **kwargs):
-    model = RepVGG(
-        num_blocks=[2, 4, 14, 1],
-        width_multiplier=[0.75, 0.75, 0.75, 2.5],
-        override_groups_map=None,
-        **kwargs)
-    _load_pretrained(
-        pretrained, model, MODEL_URLS["RepVGG_A0"], use_ssld=use_ssld)
+    model = CSPResNet()
     return model
 
 

@@ -16,6 +16,7 @@ import os
 
 import cv2
 import numpy as np
+import time
 
 from paddleclas.deploy.utils import logger, config
 from paddleclas.deploy.utils.predictor import Predictor
@@ -132,7 +133,10 @@ def main(config):
                                                          ) == len(image_list):
             if len(batch_imgs) == 0:
                 continue
+            start_time = time.time()
             batch_results = cls_predictor.predict(batch_imgs)
+            end_time = time.time()
+            print("all infer time: {} ms".format((end_time - start_time) * 1000))
             for number, result_dict in enumerate(batch_results):
                 if "PersonAttribute" in config[
                         "PostProcess"] or "VehicleAttribute" in config[
